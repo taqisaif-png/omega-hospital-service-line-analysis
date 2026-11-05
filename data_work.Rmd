@@ -1,0 +1,359 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(readr)
+library(readxl)
+library(tidyverse)
+
+path = "csv_export/"
+
+omega    = read_csv(paste0(path, "OMEGA.csv"), show_col_types = FALSE)
+drg      = read_csv(paste0(path, "DRG.csv"), show_col_types = FALSE)
+crit     = read_csv(paste0(path, "CRIT.csv"), show_col_types = FALSE)
+ome_dx   = read_csv(paste0(path, "OME_DX.csv"), show_col_types = FALSE)
+ome_px   = read_csv(paste0(path, "OME_PX.csv"), show_col_types = FALSE)
+dx11     = read_csv(paste0(path, "9DX11.csv"), show_col_types = FALSE)
+op11     = read_csv(paste0(path, "9OP11.csv"), show_col_types = FALSE)
+dispostn = read_csv(paste0(path, "DISPOSTN.csv"), show_col_types = FALSE)
+service  = read_csv(paste0(path, "SERVICE.csv"), show_col_types = FALSE)
+source   = read_csv(paste0(path, "SOURCE.csv"), show_col_types = FALSE)
+mdclist  = read_excel("data.xlsx")
+
+# clean OMEGA
+omega_clean = omega %>%
+  distinct() %>%
+  mutate(
+    DISTANCE   = ifelse(DISTANCE > 65534, NA, DISTANCE),
+    TOT_CHARGE = ifelse(TOT_CHARGE < 0, NA, TOT_CHARGE),
+    TOT_PAY    = ifelse(TOT_PAY < 0, NA, TOT_PAY),
+    TOT_COST   = ifelse(TOT_COST < 0, NA, TOT_COST),
+    RACE       = ifelse(RACE == "UNKNOWN", NA, RACE)
+  )
+
+# MDC lookup — distinct only
+mdc_lookup = mdclist %>%
+  select(mdc_code, service_line) %>%
+  distinct()
+
+# join DRG to MDC
+drg_mdc = drg %>%
+  left_join(mdc_lookup, by = c("MAJ_DX_CAT" = "mdc_code"))
+
+# join OMEGA to DRG+MDC, add profit and LOS outlier
+omega_main = omega_clean %>%
+  left_join(drg_mdc, by = "DRG") %>%
+  mutate(
+    profit      = TOT_PAY - TOT_COST,
+    los_outlier = ifelse(LOS > CUTOFF, 1, 0)
+  )
+
+# aggregate CRIT
+crit_agg = crit %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_icu_days = sum(ICU_LOS, na.rm = TRUE),
+    icu_stays      = n(),
+    .groups        = "drop"
+  )
+
+# aggregate OME_DX
+ome_dx_agg = ome_dx %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_diagnoses = max(TOT_NO_DXS, na.rm = TRUE),
+    unique_dx_codes = n_distinct(DIAGNOSIS),
+    .groups         = "drop"
+  )
+
+# aggregate OME_PX
+ome_px_agg = ome_px %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_ops       = max(TOT_NO_OPS, na.rm = TRUE),
+    unique_op_codes = n_distinct(OP_PROC_9),
+    .groups         = "drop"
+  )
+
+# newborn linkage
+mother_records = omega_clean %>%
+  select(PAT_NO, ADM_DATE, TOT_CHARGE, TOT_COST, TOT_PAY) %>%
+  rename(mother_pat_no   = PAT_NO,
+         mother_adm_date = ADM_DATE,
+         mother_charge   = TOT_CHARGE,
+         mother_cost     = TOT_COST,
+         mother_pay      = TOT_PAY)
+
+newborn_mother = omega_clean %>%
+  filter(!is.na(MOTHER_MRN) & MOTHER_MRN != 0) %>%
+  select(PAT_NO, ADM_DATE, MOTHER_MRN, TOT_CHARGE, TOT_COST, TOT_PAY) %>%
+  left_join(mother_records,
+            by           = c("MOTHER_MRN" = "mother_pat_no", "ADM_DATE" = "mother_adm_date"),
+            relationship = "many-to-many")
+
+# final dataset
+df_full = omega_main %>%
+  left_join(crit_agg,   by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(ome_dx_agg, by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(ome_px_agg, by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(dispostn %>% rename(dispostn_desc   = DESCRIPT), by = "DISPOSTN") %>%
+  left_join(source   %>% rename(adm_source_desc = DESCRIPT), by = "ADM_SOURCE") %>%
+  left_join(service  %>% rename(adm_svc_desc    = DESCRIPT), by = c("ADM_SVC" = "SERVICE"))
+
+cat("Final rows:", nrow(df_full), "\n")
+cat("Final cols:", ncol(df_full), "\n")
+```
+
+
+```{r}
+selected_lines = c("Orthopedic", "Perinatology", "HIV", "Cardiology")
+df_selected = df_full %>%
+  filter(service_line %in% selected_lines) %>%
+  select(
+    PAT_NO, ADM_DATE, DIS_DATE,
+    AGE, AGE_DAYS, BIRTH_WGHT, SEX, RACE, DISTANCE, ZIP,
+    ADM_TYPE, ADM_SOURCE, DISPOSTN, dispostn_desc,
+    CCSTAY, LOS, CUTOFF, ARITH_LOS, ELOS_UNTR, LOS_B_SURG,
+    TOT_CHARGE, TOT_PAY, TOT_COST, TOT_DIRECT,
+    EXT_REV, MAJOR_PAY, TEACH_SVC, PRIM_PAY,
+    DRG, MAJ_DX_CAT, ARITH_LOS, PARTITION,
+    WEIGHT.y, service_line, PRINCPL_DX, PCONSULTS,
+    profit, los_outlier,
+    total_icu_days, icu_stays,
+    total_diagnoses, unique_dx_codes,
+    total_ops, unique_op_codes,
+    adm_source_desc, adm_svc_desc,
+    MOTHER_MRN
+  ) %>%
+  rename(drg_weight = WEIGHT.y, mdc_code = MAJ_DX_CAT) %>%
+  mutate(
+    LOS        = ifelse(LOS > CUTOFF * 3, NA, LOS),
+    LOS_B_SURG = ifelse(LOS_B_SURG == 9999, NA, LOS_B_SURG),
+    LOS_B_SURG = ifelse(LOS_B_SURG == 9998, NA, LOS_B_SURG),
+  )
+cat("Rows per service line:\n")
+print(table(df_selected$service_line))
+cat("Total rows:", nrow(df_selected), "\n")
+cat("Total cols:", ncol(df_selected), "\n")
+```
+
+
+```{r}
+df_cardiology = df_selected %>%
+  filter(service_line == "Cardiology") %>%
+  select(PAT_NO, ADM_DATE, DIS_DATE, AGE, SEX, RACE, DISTANCE, ZIP,
+         ADM_TYPE, ADM_SOURCE, adm_source_desc, DISPOSTN, dispostn_desc, CCSTAY,
+         LOS, CUTOFF, ARITH_LOS, ELOS_UNTR, LOS_B_SURG, los_outlier,
+         TOT_CHARGE, TOT_PAY, TOT_COST, TOT_DIRECT, profit,
+         EXT_REV, MAJOR_PAY, TEACH_SVC, PRIM_PAY,
+         DRG, drg_weight, PARTITION, mdc_code, service_line,
+         PRINCPL_DX, PCONSULTS,
+         total_icu_days, icu_stays,
+         total_diagnoses, unique_dx_codes,
+         total_ops, unique_op_codes)
+
+df_orthopedic = df_selected %>%
+  filter(service_line == "Orthopedic") %>%
+  select(PAT_NO, ADM_DATE, DIS_DATE, AGE, SEX, RACE, DISTANCE, ZIP,
+         ADM_TYPE, ADM_SOURCE, adm_source_desc, DISPOSTN, dispostn_desc, CCSTAY,
+         LOS, CUTOFF, ARITH_LOS, ELOS_UNTR, LOS_B_SURG, los_outlier,
+         TOT_CHARGE, TOT_PAY, TOT_COST, TOT_DIRECT, profit,
+         EXT_REV, MAJOR_PAY, TEACH_SVC, PRIM_PAY,
+         DRG, drg_weight, PARTITION, mdc_code, service_line,
+         PRINCPL_DX, PCONSULTS,
+         total_icu_days, icu_stays,
+         total_diagnoses, unique_dx_codes,
+         total_ops, unique_op_codes)
+
+df_perinatology = df_selected %>%
+  filter(service_line == "Perinatology") %>%
+  select(PAT_NO, ADM_DATE, DIS_DATE, AGE, AGE_DAYS, BIRTH_WGHT, SEX, RACE, DISTANCE, ZIP,
+         ADM_TYPE, ADM_SOURCE, adm_source_desc, DISPOSTN, dispostn_desc, CCSTAY,
+         LOS, CUTOFF, ARITH_LOS, ELOS_UNTR, los_outlier,
+         TOT_CHARGE, TOT_PAY, TOT_COST, TOT_DIRECT, profit,
+         EXT_REV, MAJOR_PAY, TEACH_SVC, PRIM_PAY,
+         DRG, drg_weight, PARTITION, mdc_code, service_line,
+         PRINCPL_DX, PCONSULTS, MOTHER_MRN,
+         total_icu_days, icu_stays,
+         total_diagnoses, unique_dx_codes,
+         total_ops, unique_op_codes)
+
+df_hiv = df_selected %>%
+  filter(service_line == "HIV") %>%
+  select(PAT_NO, ADM_DATE, DIS_DATE, AGE, SEX, RACE, DISTANCE, ZIP,
+         ADM_TYPE, ADM_SOURCE, adm_source_desc, DISPOSTN, dispostn_desc, CCSTAY,
+         LOS, CUTOFF, ARITH_LOS, ELOS_UNTR, los_outlier,
+         TOT_CHARGE, TOT_PAY, TOT_COST, TOT_DIRECT, profit,
+         EXT_REV, MAJOR_PAY, TEACH_SVC, PRIM_PAY,
+         DRG, drg_weight, PARTITION, mdc_code, service_line,
+         PRINCPL_DX, PCONSULTS,
+         total_icu_days, icu_stays,
+         total_diagnoses, unique_dx_codes,
+         total_ops, unique_op_codes)
+
+cat("Cardiology:", nrow(df_cardiology), "\n")
+cat("Orthopedic:", nrow(df_orthopedic), "\n")
+cat("Perinatology:", nrow(df_perinatology), "\n")
+cat("HIV:", nrow(df_hiv), "\n")
+```
+```{r}
+output_path = "csv_export/"
+
+write_csv(df_cardiology,    paste0(output_path, "cardiology.csv"))
+write_csv(df_orthopedic,    paste0(output_path, "orthopedic.csv"))
+write_csv(df_perinatology,  paste0(output_path, "perinatology.csv"))
+write_csv(df_hiv,           paste0(output_path, "hiv.csv"))
+
+cat("Done.\n")
+```
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(scales)
+
+service_colors = c("Cardiology"   = "#D7191C",
+                   "Orthopedic"   = "#F4A11B",
+                   "Perinatology" = "#2C7BB6",
+                   "HIV"          = "#1A9641")
+
+# 1. Negative and zero financial values
+financial_issues = tibble(
+  field    = c("TOT_CHARGE", "TOT_COST", "TOT_PAY", "TOT_DIRECT", "TOT_CHARGE = 0"),
+  count    = c(24, 26, 4, 25, 1282),
+  category = c("Negative", "Negative", "Negative", "Negative", "Zero")
+)
+
+p1 = ggplot(financial_issues, aes(x = reorder(field, count), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = comma(count)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Negative" = "#D7191C", "Zero" = "#F4A11B")) +
+  labs(title = "Invalid Financial Values in OMEGA",
+       x = NULL, y = "Record Count", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 1500)
+
+print(p1)
+
+# 2. DISTANCE invalid values
+distance_issues = tibble(
+  category = c("Valid", "Invalid (65,535)"),
+  count    = c(nrow(omega) - 651, 651)
+)
+
+p2 = ggplot(distance_issues, aes(x = reorder(category, count), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = comma(count)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Valid" = "#2C7BB6", "Invalid (65,535)" = "#D7191C")) +
+  labs(title = "DISTANCE Field: Valid vs Invalid Values",
+       x = NULL, y = "Record Count", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 18000)
+
+print(p2)
+
+# 3. Duplicate records by table
+duplicates = tibble(
+  table = c("OMEGA", "OME_DX", "OME_PX"),
+  count = c(11, 72, 21)
+)
+
+p3 = ggplot(duplicates, aes(x = reorder(table, count), y = count, fill = table)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = count), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("OMEGA" = "#2C7BB6", "OME_DX" = "#D7191C", "OME_PX" = "#F4A11B")) +
+  labs(title = "Duplicate Records by Table",
+       x = NULL, y = "Duplicate Count", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 85)
+
+print(p3)
+
+# 4. Missing RACE
+race_missing = tibble(
+  category = c("Known", "Unknown / Missing"),
+  count    = c(nrow(omega) - 2970, 2970)
+)
+
+p4 = ggplot(race_missing, aes(x = reorder(category, count), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = comma(count)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Known" = "#2C7BB6", "Unknown / Missing" = "#D7191C")) +
+  labs(title = "RACE Field: Known vs Missing (17.7%)",
+       x = NULL, y = "Record Count", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 16000)
+
+print(p4)
+
+# 5. LOS outlier rate by service line
+los_outliers = df_selected %>%
+  group_by(service_line) %>%
+  summarise(
+    total       = n(),
+    outliers    = sum(los_outlier == 1, na.rm = TRUE),
+    outlier_pct = round(outliers / total * 100, 1)
+  )
+
+p5 = ggplot(los_outliers, aes(x = reorder(service_line, outlier_pct), y = outlier_pct, fill = service_line)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = paste0(outlier_pct, "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = service_colors) +
+  labs(title = "LOS Outlier Rate by Service Line",
+       x = NULL, y = "% of Encounters", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = max(los_outliers$outlier_pct) * 1.2)
+
+print(p5)
+
+# 6. Missing ICD descriptors
+missing_desc = tibble(
+  table   = c("9DX11 (Diagnoses)", "9OP11 (Procedures)"),
+  missing = c(15, 6)
+)
+
+p6 = ggplot(missing_desc, aes(x = reorder(table, missing), y = missing, fill = table)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = missing), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("9DX11 (Diagnoses)" = "#2C7BB6", "9OP11 (Procedures)" = "#D7191C")) +
+  labs(title = "Missing ICD Descriptors in Reference Tables",
+       x = NULL, y = "Unmatched Codes", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 20)
+
+print(p6)
+
+# 7. Newborn linkage match rate
+newborn_match = tibble(
+  category = c("Matched (within 3 days)", "Unmatched"),
+  count    = c(1138, 2319 - 1138)
+)
+
+p7 = ggplot(newborn_match, aes(x = reorder(category, count), y = count, fill = category)) +
+  geom_bar(stat = "identity") +
+  geom_text(aes(label = comma(count)), hjust = -0.1, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = c("Matched (within 3 days)" = "#1A9641", "Unmatched" = "#D7191C")) +
+  labs(title = "Newborn-to-Mother Linkage Match Rate (49.1%)",
+       x = NULL, y = "Record Count", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  expand_limits(y = 1500)
+
+print(p7)
+```
+
+
+
+
+

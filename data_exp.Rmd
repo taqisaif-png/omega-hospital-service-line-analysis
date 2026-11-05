@@ -1,0 +1,207 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Cmd+Shift+Enter*. 
+
+```{r}
+library(readr)
+library(readxl)
+library(tidyverse)
+
+
+
+path = "csv_export/"
+
+omega    = read_csv(paste0(path, "OMEGA.csv"))
+drg      = read_csv(paste0(path, "DRG.csv"))
+crit     = read_csv(paste0(path, "CRIT.csv"))
+ome_dx   = read_csv(paste0(path, "OME_DX.csv"))
+ome_px   = read_csv(paste0(path, "OME_PX.csv"))
+dx11     = read_csv(paste0(path, "9DX11.csv"))
+op11     = read_csv(paste0(path, "9OP11.csv"))
+dispostn = read_csv(paste0(path, "DISPOSTN.csv"))
+service  = read_csv(paste0(path, "SERVICE.csv"))
+source   = read_csv(paste0(path, "SOURCE.csv"))
+mdclist = read_excel("data.xlsx")
+```
+
+
+
+```{r}
+# link newborns to their mother
+
+omega_clean = omega %>% distinct()
+newborn_mother = omega_clean %>%
+  filter(!is.na(MOTHER_MRN) & MOTHER_MRN != 0) %>%
+  select(PAT_NO, ADM_DATE, MOTHER_MRN, TOT_CHARGE, TOT_COST, TOT_PAY)
+
+mother_records = omega_clean %>%
+  select(PAT_NO, ADM_DATE, TOT_CHARGE, TOT_COST, TOT_PAY) %>%
+  rename(mother_pat_no = PAT_NO,
+         mother_adm_date = ADM_DATE,
+         mother_charge = TOT_CHARGE,
+         mother_cost = TOT_COST,
+         mother_pay = TOT_PAY)
+
+linked = newborn_mother %>%
+  left_join(mother_records, by = c("MOTHER_MRN" = "mother_pat_no"))
+
+
+
+
+```
+```{r}
+linked = newborn_mother %>%
+  left_join(mother_records, by = c("MOTHER_MRN" = "mother_pat_no"),
+            relationship = "many-to-many")
+```
+
+
+```{r}
+linked %>%
+  group_by(MOTHER_MRN) %>%
+  filter(n() > 1) %>%
+  select(PAT_NO, ADM_DATE, MOTHER_MRN, TOT_CHARGE, mother_charge) %>%
+  arrange(MOTHER_MRN) %>%
+  head(20)
+```
+
+```{r}
+# check that MOTHER_MRN exists in omega_clean as a PAT_NO
+linked %>%
+  summarise(
+    total_newborns        = n(),
+    mother_found          = sum(!is.na(mother_charge)),
+    mother_not_found      = sum(is.na(mother_charge)),
+    pct_mother_found      = round(mean(!is.na(mother_charge)) * 100, 1)
+  )
+```
+```{r}
+linked %>%
+  distinct(MOTHER_MRN) %>%
+  left_join(omega_clean %>% select(PAT_NO) %>% rename(found = PAT_NO), 
+            by = c("MOTHER_MRN" = "found")) %>%
+  summarise(
+    total_mothers  = n(),
+    found_in_omega = sum(!is.na(MOTHER_MRN)),
+    not_found      = sum(is.na(MOTHER_MRN))
+  )
+```
+
+
+
+
+```{r}
+linked %>%
+  mutate(
+    ADM_DATE_dt        = as.Date(ADM_DATE, format = "%m/%d/%y"),
+    mother_adm_date_dt = as.Date(mother_adm_date, format = "%m/%d/%y"),
+    days_diff          = as.numeric(ADM_DATE_dt - mother_adm_date_dt)
+  ) %>%
+  summarise(
+    avg_days_diff = round(mean(days_diff, na.rm = TRUE), 1),
+    min_days_diff = min(days_diff, na.rm = TRUE),
+    max_days_diff = max(days_diff, na.rm = TRUE),
+    within_3_days = sum(abs(days_diff) <= 3, na.rm = TRUE),
+    pct_within_3  = round(mean(abs(days_diff) <= 3, na.rm = TRUE) * 100, 1)
+  )
+
+
+omega_clean %>% filter(PAT_NO == 0)
+
+
+
+```
+
+
+
+
+```{r}
+# Service line assignment
+omega_clean = omega %>%
+  distinct() %>%
+  mutate(
+    DISTANCE   = ifelse(DISTANCE > 65534, NA, DISTANCE),
+    TOT_CHARGE = ifelse(TOT_CHARGE < 0, NA, TOT_CHARGE),
+    TOT_PAY    = ifelse(TOT_PAY < 0, NA, TOT_PAY),
+    TOT_COST   = ifelse(TOT_COST < 0, NA, TOT_COST),
+    RACE       = ifelse(RACE == "UNKNOWN", NA, RACE)
+  )
+
+# Join DRG and MDCLIST
+drg_mdc = drg %>%
+  left_join(
+    mdclist %>% select(mdc_code, service_line),
+    by = c("MAJ_DX_CAT" = "mdc_code")
+  )
+
+# Profit and LOS outlier
+omega_main = omega_clean %>%
+  left_join(drg_mdc, by = "DRG") %>%
+  mutate(
+    profit      = TOT_PAY - TOT_COST,
+    los_outlier = ifelse(LOS > CUTOFF, 1, 0)
+  )
+
+# Aggregate CRIT
+crit_agg = crit %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_icu_days = sum(ICU_LOS, na.rm = TRUE),
+    icu_stays      = n(),
+    .groups        = "drop"
+  )
+
+# Aggregate OME_DX
+ome_dx_agg = ome_dx %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_diagnoses = max(TOT_NO_DXS, na.rm = TRUE),
+    unique_dx_codes = n_distinct(DIAGNOSIS),
+    .groups         = "drop"
+  )
+
+# Aggregate OME_PX
+ome_px_agg = ome_px %>%
+  distinct() %>%
+  group_by(PAT_NO, ADM_DATE) %>%
+  summarise(
+    total_ops      = max(TOT_NO_OPS, na.rm = TRUE),
+    unique_op_codes = n_distinct(OP_PROC_9),
+    .groups         = "drop"
+  )
+
+# Newborn linkage
+newborn_mother = omega_clean %>%
+  filter(!is.na(MOTHER_MRN) & MOTHER_MRN != 0) %>%
+  select(PAT_NO, ADM_DATE, MOTHER_MRN, TOT_CHARGE, TOT_COST, TOT_PAY)
+
+mother_records = omega_clean %>%
+  select(PAT_NO, ADM_DATE, TOT_CHARGE, TOT_COST, TOT_PAY) %>%
+  rename(mother_pat_no   = PAT_NO,
+         mother_adm_date = ADM_DATE,
+         mother_charge   = TOT_CHARGE,
+         mother_cost     = TOT_COST,
+         mother_pay      = TOT_PAY)
+
+linked = newborn_mother %>%
+  left_join(mother_records,
+            by           = c("MOTHER_MRN" = "mother_pat_no", "ADM_DATE" = "mother_adm_date"),
+            relationship = "many-to-many")
+
+# Final join
+df_full = omega_main %>%
+  left_join(crit_agg,    by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(ome_dx_agg,  by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(ome_px_agg,  by = c("PAT_NO", "ADM_DATE")) %>%
+  left_join(dispostn %>% rename(dispostn_desc   = DESCRIPT), by = "DISPOSTN") %>%
+  left_join(source   %>% rename(adm_source_desc = DESCRIPT), by = "ADM_SOURCE") %>%
+  left_join(service  %>% rename(adm_svc_desc    = DESCRIPT), by = c("ADM_SVC" = "SERVICE"))
+```
+

@@ -1,0 +1,10 @@
+csv_export/
+*.csv
+*.xlsx
+*.accdb
+*.hyper
+*.RData
+.Rhistory
+*.nb.html
+.env
+.DS_Store
